@@ -1,7 +1,9 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
-import requests, base64, re, os
+import cv2
+import numpy as np
+import os
 
 load_dotenv()
 
@@ -14,80 +16,82 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-API_KEY = os.getenv("OPENROUTER_API_KEY")
+def classify_gram(image_bytes: bytes):
+    nparr = np.frombuffer(image_bytes, np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    
+    if img is None:
+        raise ValueError("Bild konnte nicht gelesen werden oder Format wird nicht unterstützt")
 
-PROMPT = """You are an expert microbiologist specializing in Gram stain analysis.
-Look carefully at the COLOR and SHAPE of the bacteria in this microscopy image.
-STEP 1 - COLOR (Gram stain result):
-- Purple or violet = Gram-POSITIVE
-- Pink or red = Gram-NEGATIVE
-STEP 2 - SHAPE:
-- Round, spherical, oval cells = COCCI
-- Rod-shaped, elongated cells = BACILLI
-STEP 3 - Choose exactly ONE of these 4 classes:
-1. Gram-positive Cocci
-2. Gram-positive Bacilli
-3. Gram-negative Cocci
-4. Gram-negative Bacilli
-Respond ONLY in this exact format, nothing else:
-Class: [one of the 4 classes above]
-Gram: [positive or negative]
-Shape: [cocci or bacilli]
-Confidence: [high / medium / low]
-Reason: [one sentence describing what you see] and the answer cannot be None"""
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+
+    # GRAM POSITIVE (purple / violet)
+    lower_purple = np.array([120, 40, 40])
+    upper_purple = np.array([170, 255, 255])
+    purple_mask = cv2.inRange(hsv, lower_purple, upper_purple)
+
+    lower_blue = np.array([90, 40, 40])
+    upper_blue = np.array([130, 255, 255])
+    blue_mask = cv2.inRange(hsv, lower_blue, upper_blue)
+
+    gram_positive_mask = purple_mask + blue_mask
+
+    # GRAM NEGATIVE (pink / red)
+    lower_red1 = np.array([0, 50, 50])
+    upper_red1 = np.array([10, 255, 255])
+    lower_red2 = np.array([170, 50, 50])
+    upper_red2 = np.array([180, 255, 255])
+    red_mask = cv2.inRange(hsv, lower_red1, upper_red1) + cv2.inRange(hsv, lower_red2, upper_red2)
+
+    lower_pink = np.array([140, 30, 50])
+    upper_pink = np.array([170, 200, 255])
+    pink_mask = cv2.inRange(hsv, lower_pink, upper_pink)
+
+    gram_negative_mask = red_mask + pink_mask
+
+    total_pixels = hsv.shape[0] * hsv.shape[1]
+    pos_ratio = np.sum(gram_positive_mask > 0) / total_pixels
+    neg_ratio = np.sum(gram_negative_mask > 0) / total_pixels
+
+    if pos_ratio > neg_ratio:
+        gram = "positive"
+        confidence = pos_ratio / (pos_ratio + neg_ratio + 1e-8)
+    else:
+        gram = "negative"
+        confidence = neg_ratio / (pos_ratio + neg_ratio + 1e-8)
+
+    return {
+        "gram": gram,
+        "confidence": float(confidence),
+        "positive_ratio": float(pos_ratio),
+        "negative_ratio": float(neg_ratio)
+    }
 
 
 @app.post("/predict/")
 async def predict(file: UploadFile = File(...)):
-    if not API_KEY:
-        raise HTTPException(status_code=500, detail="API Key fehlt")
+    if not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Nur Bild-Dateien erlaubt")
 
     image_data = await file.read()
-    base64_image = base64.b64encode(image_data).decode("utf-8")
 
     try:
-        response = requests.post(
-            url="https://openrouter.ai/api/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {API_KEY}",
-                "Content-Type": "application/json"
-            },
-            json={
-                "model": "nvidia/nemotron-nano-12b-v2-vl:free",
-                "messages": [{
-                    "role": "user",
-                    "content": [
-                        {"type": "image_url",
-                         "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}},
-                        {"type": "text", "text": PROMPT}
-                    ]
-                }]
-            },
-            timeout=30
-        )
-        response.raise_for_status()
+        result = classify_gram(image_data)
+        
+        return {
+            "class": f"Gram-{result['gram'].capitalize()}",
+            "gram": result["gram"],
+            "positive_ratio": result["positive_ratio"],
+            "negative_ratio": result["negative_ratio"],
+            "confidence": result["confidence"]
+        }
 
-    except requests.exceptions.Timeout:
-        raise HTTPException(status_code=504, detail="OpenRouter Timeout")
-    except requests.exceptions.RequestException as e:
-        raise HTTPException(status_code=502, detail=str(e))
-
-    text = response.json()["choices"][0]["message"]["content"]
-
-    def extract(pattern):
-        m = re.search(pattern, text, re.IGNORECASE)
-        return m.group(1).strip() if m else "Unknown"
-
-    return {
-        "class":      extract(r'class:\s*(.+)'),
-        "gram":       extract(r'gram:\s*(.+)'),
-        "shape":      extract(r'shape:\s*(.+)'),
-        "confidence": extract(r'confidence:\s*(.+)'),
-        "reason":     extract(r'reason:\s*(.+)'),
-        "raw":        text
-    }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Fehler bei der Bildverarbeitung: {str(e)}")
 
 
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "MUST Lab API läuft"}
+    return {"status": "ok", "message": "MUST Lab API läuft (Color-based Gram Detection)"}
