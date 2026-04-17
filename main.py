@@ -1,11 +1,9 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from dotenv import load_dotenv
 import cv2
 import numpy as np
 import os
 
-load_dotenv()
 
 app = FastAPI(title="MUST Lab - Bacteria Detection")
 

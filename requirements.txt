@@ -1,5 +1,5 @@
 fastapi
 uvicorn
-requests
 python-multipart
-python-dotenv
+numpy
+opencv-python
